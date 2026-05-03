@@ -433,6 +433,17 @@ def _norm_dub_name(name: str) -> str:
     return s
 
 
+def _iframe_preference_score(url: str) -> int:
+    value = (url or "").lower()
+    if "iframecvh.html" in value:
+        return 30
+    if "kodikplayer.com" in value:
+        return 20
+    if "alloha.yani.tv" in value:
+        return 10
+    return 0
+
+
 @app.get("/src/dubs")
 async def dubs_for_episode(key: str, source: str = "anilibria"):
     if source in NATIVE_SOURCES:
@@ -652,13 +663,20 @@ async def _native_dubs(source: str, key: str):
             d = v.get("data") or {}
             name = (d.get("dubbing") or d.get("player") or "—").strip()
             norm = _norm_dub_name(name)
-            if not norm or norm in seen:
+            if not norm:
+                continue
+            iframe_url = v.get("iframe_url") or ""
+            score = _iframe_preference_score(iframe_url)
+            if norm in seen and score <= seen[norm].get("_score", -1):
                 continue
             kind = "sub" if "субтитры" in name.lower() else "voice"
             dk = _put({"type": "dub", "source": "oldyummy",
-                       "iframe_url": v.get("iframe_url"), "name": name})
-            seen[norm] = {"name": name, "norm": norm, "kind": kind, "key": dk}
-        return list(seen.values())
+                       "iframe_url": iframe_url, "name": name})
+            seen[norm] = {"name": name, "norm": norm, "kind": kind, "key": dk, "_score": score}
+        return [
+            {item_key: item_value for item_key, item_value in item.items() if item_key != "_score"}
+            for item in seen.values()
+        ]
     return []
 
 

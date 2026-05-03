@@ -31,7 +31,7 @@ kodik_router = APIRouter()
 
 _client: httpx.AsyncClient | None = None
 _MAX_TEXT_REWRITE = int(os.environ.get("AV_PLAYER_PROXY_MAX_TEXT_REWRITE", str(3 * 1024 * 1024)))
-_PROXY_VERSION = "20260503-player20"
+_PROXY_VERSION = "20260504-player26"
 _KODIK_SKIN_CSS = Path(__file__).resolve().parent.parent / "assets" / "player" / "kodik-skin.css"
 _SHIELD_LOGGER_JS = (
     '(function(){var q=[],c={};try{["log","warn","error","info","debug"].forEach(function(m){'
@@ -392,33 +392,51 @@ def _is_cvh_iframe_url(url: str) -> bool:
 
 
 def _pick_cvh_item(items: list[dict], episode: int, voice_code: str) -> dict | None:
-    episode_items = [item for item in items if int(item.get("episode") or 0) == episode] or items
+    def item_episode(item: dict) -> int:
+        try:
+            return int(item.get("episode") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def norm(value: str) -> str:
+        return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+    episode_items = [item for item in items if item_episode(item) == episode] or items
     if voice_code:
-        wanted = voice_code.strip().lower()
+        wanted = norm(voice_code)
         for item in episode_items:
-            if str(item.get("voiceStudio") or "").strip().lower() == wanted:
+            if norm(str(item.get("voiceStudio") or "")) == wanted:
                 return item
     return episode_items[0] if episode_items else None
 
 
-def _pick_cvh_video_source(data: dict) -> str:
+def _cvh_video_sources(data: dict) -> list[dict[str, str]]:
     sources = data.get("sources") if isinstance(data, dict) else {}
     if not isinstance(sources, dict):
-        return ""
-    for key in (
-        "mpegFullHdUrl",
-        "mpegHighUrl",
-        "mpegMediumUrl",
-        "mpegLowUrl",
-        "mpegLowestUrl",
-        "mpegTinyUrl",
-        "hlsUrl",
-        "dashUrl",
-    ):
+        return []
+    variants = (
+        ("mpegFullHdUrl", "1080p"),
+        ("mpegHighUrl", "720p"),
+        ("mpegMediumUrl", "480p"),
+        ("mpegLowUrl", "360p"),
+        ("mpegLowestUrl", "240p"),
+        ("mpegTinyUrl", "144p"),
+    )
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for key, label in variants:
         value = sources.get(key)
-        if isinstance(value, str) and value.startswith("http"):
-            return value
-    return ""
+        if not isinstance(value, str) or not value.startswith("http") or value in seen:
+            continue
+        seen.add(value)
+        out.append({"label": label, "url": value})
+    if not out:
+        for key in ("hlsUrl", "dashUrl"):
+            value = sources.get(key)
+            if isinstance(value, str) and value.startswith("http") and value not in seen:
+                out.append({"label": "Auto", "url": value})
+                break
+    return out
 
 
 def _cvh_error_frame(message: str) -> Response:
@@ -438,96 +456,385 @@ def _clean_video_frame(
     poster_url: str = "",
     *,
     element_id: str = "av-clean-video",
+    sources: list[dict[str, str]] | None = None,
 ) -> Response:
-    proxied_src = html.escape(_proxy_url(source_url, base_url), quote=True)
+    source_items: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for item in sources or []:
+        raw_url = str(item.get("url") or "").strip()
+        if not raw_url or raw_url in seen_urls:
+            continue
+        seen_urls.add(raw_url)
+        source_items.append({
+            "label": str(item.get("label") or "Auto"),
+            "url": _proxy_url(raw_url, base_url),
+        })
+    if not source_items and source_url:
+        source_items.append({"label": "Auto", "url": _proxy_url(source_url, base_url)})
+
+    proxied_src = html.escape(source_items[0]["url"] if source_items else "", quote=True)
     safe_id = html.escape(element_id, quote=True)
     proxied_poster = html.escape(_proxy_url(poster_url, base_url), quote=True) if poster_url else ""
     poster_attr = f' poster="{proxied_poster}"' if proxied_poster else ""
+    sources_json = json.dumps(source_items, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
     body = f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 html,body{{margin:0;width:100%;height:100%;background:#050507;overflow:hidden}}
 body{{display:flex;position:relative}}
 video{{width:100%;height:100%;background:#050507;object-fit:contain}}
+video::-webkit-media-controls-start-playback-button,video::-webkit-media-controls-overlay-play-button{{display:none!important;-webkit-appearance:none}}
 #av-start{{position:absolute;left:50%;top:50%;width:72px;height:72px;margin:-36px 0 0 -36px;border:0;border-radius:50%;
 background:rgba(255,91,103,.94);box-shadow:0 14px 40px rgba(0,0,0,.35);cursor:pointer;display:grid;place-items:center}}
 #av-start span{{display:block;width:0;height:0;border-top:15px solid transparent;border-bottom:15px solid transparent;
 border-left:22px solid #fff;margin-left:6px}}
 #av-start.hidden{{display:none}}
+#av-shot{{position:absolute;right:12px;top:12px;width:42px;height:40px;border:0;border-radius:8px;background:rgba(8,8,12,.74);border:1px solid rgba(255,255,255,.12);color:#fff;display:grid;place-items:center;cursor:pointer;box-shadow:0 8px 20px rgba(0,0,0,.28);backdrop-filter:blur(8px);transition:background .16s ease,opacity .16s ease,transform .16s ease;z-index:3}}
+#av-shot:hover{{background:rgba(255,255,255,.22)}}
+#av-shot svg{{width:19px;height:19px;display:block}}
+#av-controls{{position:absolute;left:12px;right:12px;bottom:12px;display:grid;grid-template-columns:54px minmax(90px,1fr) auto 112px 92px 48px;align-items:center;gap:10px;padding:10px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:rgba(8,8,12,.74);box-shadow:0 14px 40px rgba(0,0,0,.35);backdrop-filter:blur(8px);opacity:.96;transition:opacity .16s ease,transform .16s ease}}
+body.playing.controls-hidden #av-controls{{opacity:0;transform:translateY(12px);pointer-events:none}}
+body.playing.controls-hidden #av-shot{{opacity:0;transform:translateY(-8px);pointer-events:none}}
+body.playing.controls-hidden{{cursor:none}}
+#av-toggle,#av-fullscreen,#av-mute,#av-quality-btn{{height:40px;border:0;border-radius:8px;color:#fff;font:700 15px Arial,sans-serif;box-shadow:0 8px 20px rgba(0,0,0,.28);display:grid;place-items:center;cursor:pointer}}
+#av-toggle,#av-fullscreen,#av-mute{{width:48px}}
+#av-toggle{{background:rgba(255,91,103,.94)}}
+#av-fullscreen{{background:rgba(255,255,255,.14)}}
+#av-fullscreen:hover,#av-mute:hover,#av-quality-btn:hover{{background:rgba(255,255,255,.22)}}
+.av-fullscreen-icon{{width:18px;height:18px;display:block;background:linear-gradient(#fff,#fff) left top/8px 2px no-repeat,linear-gradient(#fff,#fff) left top/2px 8px no-repeat,linear-gradient(#fff,#fff) right top/8px 2px no-repeat,linear-gradient(#fff,#fff) right top/2px 8px no-repeat,linear-gradient(#fff,#fff) left bottom/8px 2px no-repeat,linear-gradient(#fff,#fff) left bottom/2px 8px no-repeat,linear-gradient(#fff,#fff) right bottom/8px 2px no-repeat,linear-gradient(#fff,#fff) right bottom/2px 8px no-repeat}}
+#av-seek{{width:100%;accent-color:#ff5b67;cursor:pointer}}
+#av-time{{min-width:92px;color:#fff;font:600 13px Arial,sans-serif;text-align:center;font-variant-numeric:tabular-nums;white-space:nowrap}}
+#av-volume{{display:flex;align-items:center;gap:8px;min-width:0}}
+#av-mute{{background:rgba(255,255,255,.14);box-shadow:none;flex:0 0 38px;width:38px}}
+.av-volume-icon{{width:20px;height:20px;display:block}}
+.av-volume-off{{display:none}}
+body.muted .av-volume-on{{display:none}}
+body.muted .av-volume-off{{display:block}}
+#av-volume-range{{width:66px;accent-color:#ff5b67;cursor:pointer}}
+#av-quality-wrap{{position:relative}}
+#av-quality-btn{{width:92px;background:rgba(255,255,255,.14);grid-template-columns:1fr auto;gap:8px;padding:0 10px;text-align:left}}
+#av-quality-btn:after{{content:"";width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid #fff;opacity:.85}}
+#av-quality-menu{{position:absolute;right:0;bottom:calc(100% + 8px);min-width:116px;max-height:190px;overflow:auto;padding:6px;border:1px solid rgba(255,255,255,.14);border-radius:9px;background:rgba(20,20,24,.96);box-shadow:0 18px 42px rgba(0,0,0,.48);display:none;z-index:4}}
+#av-quality-wrap.open #av-quality-menu{{display:grid;gap:4px}}
+#av-quality-menu button{{height:34px;border:0;border-radius:7px;background:transparent;color:#fff;font:700 13px Arial,sans-serif;text-align:left;padding:0 10px;cursor:pointer}}
+#av-quality-menu button:hover,#av-quality-menu button.active{{background:rgba(255,91,103,.9)}}
+#av-quality-wrap.disabled{{display:none}}
+@media (max-width:700px){{#av-controls{{left:8px;right:8px;bottom:8px;grid-template-columns:44px minmax(70px,1fr) 92px 44px;gap:7px;padding:8px}}#av-toggle,#av-fullscreen{{width:44px;height:38px}}#av-time,#av-volume{{display:none}}#av-quality-btn{{width:92px;height:38px}}}}
 </style></head><body>
-<video id="{safe_id}" src="{proxied_src}"{poster_attr} controls playsinline preload="metadata"></video>
+<video id="{safe_id}" src="{proxied_src}"{poster_attr} playsinline preload="metadata" crossorigin="anonymous"></video>
 <button id="av-start" type="button" aria-label="Play"><span></span></button>
+<button id="av-shot" type="button" aria-label="Сделать скриншот" title="Сделать скриншот">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 4h6l1.6 2H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h3.4L9 4Zm3 5a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm0 2a2 2 0 1 1 0 4 2 2 0 0 1 0-4Z"/></svg>
+</button>
+<div id="av-controls">
+  <button id="av-toggle" type="button" aria-label="Play or pause">&#9654;</button>
+  <input id="av-seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Seek">
+  <div id="av-time">0:00 / 0:00</div>
+  <div id="av-volume">
+    <button id="av-mute" type="button" aria-label="Mute">
+      <svg class="av-volume-icon av-volume-on" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm12.2-1.2-1.4 1.4A4 4 0 0 1 16 12a4 4 0 0 1-1.2 2.8l1.4 1.4A6 6 0 0 0 18 12a6 6 0 0 0-1.8-4.2Zm2.8-2.8-1.4 1.4A8 8 0 0 1 20 12a8 8 0 0 1-2.4 5.6L19 19a10 10 0 0 0 3-7 10 10 0 0 0-3-7Z"/></svg>
+      <svg class="av-volume-icon av-volume-off" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 9v6h4l5 4V5L8 9H4Zm14.6 3 2.7-2.7-1.4-1.4-2.7 2.7-2.7-2.7-1.4 1.4 2.7 2.7-2.7 2.7 1.4 1.4 2.7-2.7 2.7 2.7 1.4-1.4-2.7-2.7Z"/></svg>
+    </button>
+    <input id="av-volume-range" type="range" min="0" max="100" value="100" step="1" aria-label="Volume">
+  </div>
+  <div id="av-quality-wrap">
+    <button id="av-quality-btn" type="button" aria-label="Quality">Auto</button>
+    <div id="av-quality-menu" role="menu"></div>
+  </div>
+  <button id="av-fullscreen" type="button" aria-label="Fullscreen"><span class="av-fullscreen-icon"></span></button>
+</div>
 <script>
 (() => {{
   const video = document.getElementById("{safe_id}");
   const start = document.getElementById("av-start");
+  const shot = document.getElementById("av-shot");
+  const controls = document.getElementById("av-controls");
+  const toggle = document.getElementById("av-toggle");
+  const seek = document.getElementById("av-seek");
+  const timeText = document.getElementById("av-time");
+  const mute = document.getElementById("av-mute");
+  const volumeRange = document.getElementById("av-volume-range");
+  const qualityWrap = document.getElementById("av-quality-wrap");
+  const qualityBtn = document.getElementById("av-quality-btn");
+  const qualityMenu = document.getElementById("av-quality-menu");
+  const fullscreen = document.getElementById("av-fullscreen");
+  const sources = {sources_json};
+  let controlsTimer = 0;
+  let seeking = false;
+  let currentQuality = 0;
   const send = (key, value) => {{
     try {{ parent.postMessage({{ key, value }}, "*"); }} catch (_) {{}}
   }};
   const sendShotError = (message) => {{
     try {{ parent.postMessage({{ type: "asoplay:screenshot-error", message }}, "*"); }} catch (_) {{}}
   }};
-  const captureScreenshot = () => {{
+  const waitForDrawableFrame = (item) => new Promise((resolve) => {{
+    let done = false;
+    const finish = () => {{
+      if (done) return;
+      done = true;
+      try {{ item.removeEventListener("loadeddata", finish); }} catch (_) {{}}
+      resolve();
+    }};
+    try {{
+      if (item.readyState < 2) item.addEventListener("loadeddata", finish, {{ once: true }});
+      if (typeof item.requestVideoFrameCallback === "function") item.requestVideoFrameCallback(finish);
+    }} catch (_) {{}}
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+    setTimeout(finish, 450);
+  }});
+  const canvasLooksEmpty = (canvas) => {{
+    const probe = document.createElement("canvas");
+    const width = Math.min(24, Math.max(1, canvas.width));
+    const height = Math.min(24, Math.max(1, canvas.height));
+    probe.width = width;
+    probe.height = height;
+    const ctx = probe.getContext("2d", {{ willReadFrequently: true }});
+    if (!ctx) return false;
+    ctx.drawImage(canvas, 0, 0, width, height);
+    const data = ctx.getImageData(0, 0, width, height).data;
+    let alpha = 0;
+    for (let i = 3; i < data.length; i += 4) alpha += data[i];
+    return alpha < width * height * 8;
+  }};
+  const drawViaImageCapture = async (item) => {{
+    try {{
+      if (!item.captureStream || !window.ImageCapture) return null;
+      const stream = item.captureStream();
+      const track = stream && stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+      if (!track) return null;
+      try {{
+        const bitmap = await new ImageCapture(track).grabFrame();
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width || item.videoWidth;
+        canvas.height = bitmap.height || item.videoHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return null;
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        if (bitmap.close) bitmap.close();
+        return canvasLooksEmpty(canvas) ? null : canvas;
+      }} finally {{
+        try {{ track.stop(); }} catch (_) {{}}
+      }}
+    }} catch (_) {{
+      return null;
+    }}
+  }};
+  const makeFrameCanvas = async (item) => {{
+    await waitForDrawableFrame(item);
+    const canvas = document.createElement("canvas");
+    canvas.width = item.videoWidth;
+    canvas.height = item.videoHeight;
+    const ctx = canvas.getContext("2d", {{ willReadFrequently: true }});
+    if (!ctx) throw new Error("canvas unavailable");
+    ctx.drawImage(item, 0, 0, canvas.width, canvas.height);
+    if (canvasLooksEmpty(canvas)) {{
+      const fallback = await drawViaImageCapture(item);
+      if (fallback) return fallback;
+      throw new Error("blank frame");
+    }}
+    return canvas;
+  }};
+  const canvasToDataUrl = (canvas) => new Promise((resolve, reject) => {{
+    if (canvas.toBlob && window.FileReader) {{
+      canvas.toBlob((blob) => {{
+        if (!blob) {{ reject(new Error("empty blob")); return; }}
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("reader failed"));
+        reader.readAsDataURL(blob);
+      }}, "image/png");
+    }} else {{
+      try {{ resolve(canvas.toDataURL("image/png")); }} catch (err) {{ reject(err); }}
+    }}
+  }});
+  const captureScreenshot = async () => {{
     if (!video || !video.videoWidth || !video.videoHeight) {{
       sendShotError("Кадр еще не готов. Запустите видео и попробуйте снова.");
       return;
     }}
     try {{
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("canvas unavailable");
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const done = (dataUrl) => {{
-        try {{
-          parent.postMessage({{
-            type: "asoplay:screenshot",
-            dataUrl,
-            width: canvas.width,
-            height: canvas.height,
-            time: Number(video.currentTime) || 0,
-            title: document.title || ""
-          }}, "*");
-        }} catch (_) {{}}
-      }};
-      if (canvas.toBlob && window.FileReader) {{
-        canvas.toBlob((blob) => {{
-          if (!blob) {{
-            sendShotError("Не удалось сохранить кадр.");
-            return;
-          }}
-          const reader = new FileReader();
-          reader.onload = () => done(String(reader.result || ""));
-          reader.onerror = () => sendShotError("Не удалось прочитать кадр.");
-          reader.readAsDataURL(blob);
-        }}, "image/png");
-      }} else {{
-        done(canvas.toDataURL("image/png"));
-      }}
+      const canvas = await makeFrameCanvas(video);
+      const dataUrl = await canvasToDataUrl(canvas);
+      try {{
+        parent.postMessage({{
+          type: "asoplay:screenshot",
+          dataUrl,
+          width: canvas.width,
+          height: canvas.height,
+          time: Number(video.currentTime) || 0,
+          title: document.title || ""
+        }}, "*");
+      }} catch (_) {{}}
     }} catch (err) {{
       const name = err && err.name ? String(err.name) : "";
       sendShotError(name === "SecurityError"
         ? "Источник не разрешил снять кадр из видео."
-        : "Не удалось сделать скриншот.");
+        : "Кадр еще не отрисовался. Запустите видео и попробуйте снова.");
     }}
   }};
   const sendTime = () => {{
     const duration = Number.isFinite(video.duration) ? video.duration : 0;
     const time = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    syncProgress();
     if (duration > 0) send("kodik_player_duration_update", duration);
-    if (time > 0) send("kodik_player_time_update", time);
+    if (time >= 0) send("kodik_player_time_update", time);
+  }};
+  const fmt = (value) => {{
+    value = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+    const h = Math.floor(value / 3600);
+    const m = Math.floor((value % 3600) / 60);
+    const s = value % 60;
+    return h ? h + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0") : m + ":" + String(s).padStart(2, "0");
+  }};
+  const syncProgress = () => {{
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const time = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    if (!seeking) seek.value = duration > 0 ? String(Math.min(1000, Math.max(0, Math.round(time / duration * 1000)))) : "0";
+    timeText.textContent = fmt(time) + " / " + fmt(duration);
   }};
   const showStart = () => {{ if (video.paused && !video.ended) start.classList.remove("hidden"); }};
   const hideStart = () => start.classList.add("hidden");
+  const syncToggle = () => {{
+    toggle.innerHTML = video.paused ? "&#9654;" : "&#10074;&#10074;";
+    document.body.classList.toggle("playing", !video.paused && !video.ended);
+    if (video.paused || video.ended) {{
+      document.body.classList.remove("controls-hidden");
+      clearTimeout(controlsTimer);
+    }}
+  }};
+  const scheduleControlsHide = (delay = 4000) => {{
+    clearTimeout(controlsTimer);
+    if (!video.paused && !video.ended) {{
+      controlsTimer = setTimeout(() => {{
+        if (!video.paused && !video.ended && !qualityWrap.classList.contains("open")) {{
+          document.body.classList.add("controls-hidden");
+        }}
+      }}, delay);
+    }}
+  }};
+  const showControls = () => {{
+    document.body.classList.remove("controls-hidden");
+    scheduleControlsHide();
+  }};
   const tryPlay = () => {{
     hideStart();
     const p = video.play();
     if (p && typeof p.catch === "function") p.catch(showStart);
+    scheduleControlsHide();
   }};
+  const togglePlay = () => {{
+    if (video.paused || video.ended) tryPlay();
+    else video.pause();
+    showControls();
+  }};
+  const syncVolume = () => {{
+    volumeRange.value = String(Math.round((video.muted ? 0 : video.volume) * 100));
+    document.body.classList.toggle("muted", video.muted || video.volume <= 0);
+    mute.setAttribute("aria-label", video.muted || video.volume <= 0 ? "Включить звук" : "Выключить звук");
+  }};
+  try {{
+    const savedVolume = Number(localStorage.getItem("asoplay:clean-player-volume"));
+    if (Number.isFinite(savedVolume)) video.volume = Math.min(1, Math.max(0, savedVolume));
+  }} catch (_) {{}}
+  syncVolume();
+  mute.addEventListener("click", () => {{
+    video.muted = !video.muted;
+    if (!video.muted && video.volume <= 0) video.volume = 0.75;
+    syncVolume();
+    showControls();
+  }});
+  volumeRange.addEventListener("input", () => {{
+    const value = Math.min(100, Math.max(0, Number(volumeRange.value) || 0)) / 100;
+    video.volume = value;
+    video.muted = value <= 0;
+    try {{ localStorage.setItem("asoplay:clean-player-volume", String(value)); }} catch (_) {{}}
+    syncVolume();
+    showControls();
+  }});
+  const closeQuality = () => {{
+    if (!qualityWrap.classList.contains("open")) return;
+    qualityWrap.classList.remove("open");
+    scheduleControlsHide();
+  }};
+  const renderQuality = () => {{
+    qualityMenu.innerHTML = "";
+    const list = Array.isArray(sources) ? sources : [];
+    if (!list.length) {{
+      qualityWrap.classList.add("disabled");
+      return;
+    }}
+    qualityBtn.textContent = list[currentQuality] && list[currentQuality].label ? list[currentQuality].label : "Auto";
+    if (list.length <= 1) return;
+    list.forEach((item, index) => {{
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = item.label || "Auto";
+      button.className = index === currentQuality ? "active" : "";
+      button.addEventListener("click", () => selectQuality(index));
+      qualityMenu.appendChild(button);
+    }});
+  }};
+  const selectQuality = (index) => {{
+    const item = sources[index];
+    if (!item || !item.url) return;
+    const time = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const wasPaused = video.paused;
+    currentQuality = index;
+    renderQuality();
+    closeQuality();
+    const resume = () => {{
+      if (time > 0) {{
+        try {{ video.currentTime = time; }} catch (_) {{}}
+      }}
+      if (!wasPaused) tryPlay();
+      video.removeEventListener("loadedmetadata", resume);
+    }};
+    video.addEventListener("loadedmetadata", resume);
+    video.src = item.url;
+    video.load();
+    showControls();
+  }};
+  renderQuality();
+  qualityBtn.addEventListener("click", () => {{
+    if (!Array.isArray(sources) || sources.length <= 1) return;
+    qualityWrap.classList.toggle("open");
+    document.body.classList.remove("controls-hidden");
+    if (qualityWrap.classList.contains("open")) clearTimeout(controlsTimer);
+    else scheduleControlsHide();
+  }});
+  document.addEventListener("pointerdown", (event) => {{
+    if (!qualityWrap.contains(event.target)) closeQuality();
+  }}, true);
   start.addEventListener("click", tryPlay);
+  shot.addEventListener("click", () => {{ captureScreenshot(); showControls(); }});
+  toggle.addEventListener("click", togglePlay);
+  video.addEventListener("click", togglePlay);
+  seek.addEventListener("input", () => {{
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    if (duration > 0) video.currentTime = duration * (Number(seek.value) || 0) / 1000;
+    showControls();
+  }});
+  seek.addEventListener("pointerdown", () => {{ seeking = true; }});
+  seek.addEventListener("pointerup", () => {{ seeking = false; syncProgress(); }});
+  seek.addEventListener("change", () => {{ seeking = false; syncProgress(); }});
+  fullscreen.addEventListener("click", () => {{
+    const root = document.documentElement;
+    if (document.fullscreenElement) {{
+      document.exitFullscreen && document.exitFullscreen();
+    }} else if (root.requestFullscreen) {{
+      root.requestFullscreen().catch(() => {{}});
+    }} else if (video.webkitEnterFullscreen) {{
+      video.webkitEnterFullscreen();
+    }}
+    showControls();
+  }});
+  document.addEventListener("mousemove", showControls, true);
+  document.addEventListener("pointermove", showControls, true);
+  document.addEventListener("focusin", showControls, true);
   document.addEventListener("pointerdown", (event) => {{
     if (event.button !== 0) return;
+    showControls();
     try {{ parent.postMessage({{ type: "asoplay:player-pointerdown" }}, "*"); }} catch (_) {{}}
   }}, true);
   document.addEventListener("contextmenu", (event) => {{
@@ -539,15 +846,19 @@ border-left:22px solid #fff;margin-left:6px}}
     if (data && typeof data === "object" && data.type === "asoplay:capture-screenshot") captureScreenshot();
   }});
   video.addEventListener("loadedmetadata", sendTime);
+  video.addEventListener("durationchange", sendTime);
   video.addEventListener("canplay", () => {{ sendTime(); if (video.paused) showStart(); }});
   video.addEventListener("timeupdate", sendTime);
-  video.addEventListener("playing", hideStart);
-  video.addEventListener("play", () => send("kodik_player_play"));
-  video.addEventListener("pause", () => {{ send("kodik_player_pause"); showStart(); }});
+  video.addEventListener("volumechange", syncVolume);
+  video.addEventListener("playing", () => {{ hideStart(); syncToggle(); scheduleControlsHide(); }});
+  video.addEventListener("play", () => {{ syncToggle(); scheduleControlsHide(); send("kodik_player_play"); }});
+  video.addEventListener("pause", () => {{ syncToggle(); send("kodik_player_pause"); showStart(); }});
   video.addEventListener("ended", () => send("kodik_player_video_ended"));
-  video.addEventListener("error", showStart);
+  video.addEventListener("error", () => {{ showStart(); document.body.classList.remove("controls-hidden"); }});
   setInterval(sendTime, 1000);
   try {{ video.load(); }} catch (_) {{}}
+  syncToggle();
+  syncProgress();
   setTimeout(() => {{ if (video.paused) showStart(); }}, 500);
 }})();
 </script></body></html>"""
@@ -622,12 +933,18 @@ async def _cvh_frame(request: Request, iframe_url: str) -> Response:
         log.exception("cvh video source failed")
         return _cvh_error_frame("Видео не загрузилось")
 
-    source_url = _pick_cvh_video_source(video_data)
-    if not source_url:
+    source_items = _cvh_video_sources(video_data)
+    if not source_items:
         return _cvh_error_frame("Видео не найдено")
 
     poster_url = video_data.get("thumbUrl") if isinstance(video_data, dict) else ""
-    return _clean_video_frame(source_url, video_url, poster_url, element_id="av-cvh-video")
+    return _clean_video_frame(
+        source_items[0]["url"],
+        video_url,
+        poster_url,
+        element_id="av-cvh-video",
+        sources=source_items,
+    )
 
 
 def _is_sibnet_iframe_url(url: str) -> bool:
@@ -690,9 +1007,18 @@ def _is_kodik_base(base: str) -> bool:
     return host == "kodikplayer.com" or host.endswith(".kodikplayer.com")
 
 
+def _is_alloha_base(base: str) -> bool:
+    try:
+        host = urlparse(base).netloc.lower()
+    except Exception:
+        return False
+    return host == "alloha.yani.tv" or host.endswith(".alloha.yani.tv")
+
+
 def _bridge_script(base: str) -> str:
     base_js = json.dumps(base)
     is_kodik_js = json.dumps(_is_kodik_base(base))
+    is_alloha_js = json.dumps(_is_alloha_base(base))
     kodik_skin = (
         f'<link rel="stylesheet" href="/player/kodik-skin.css?v={_PROXY_VERSION}">\n'
         if _is_kodik_base(base) else ""
@@ -705,6 +1031,7 @@ def _bridge_script(base: str) -> str:
   "use strict";
   const BASE = {base_js};
   const IS_KODIK = {is_kodik_js};
+  const IS_ALLOHA = {is_alloha_js};
   const UPSTREAM_ORIGIN = new URL(BASE).origin;
   const LOCAL_ORIGIN = location.origin;
   const AD_RE = /(casino|bookmaker|betting|vulkan|1xbet|pin[-\\s]?up|av\\s*casino|werbung|реклам|казино|ставк|букмекер|advert|preroll|vast|vpaid|popunder)/i;
@@ -883,9 +1210,71 @@ def _bridge_script(base: str) -> str:
   }};
   ensureStorage("localStorage");
   ensureStorage("sessionStorage");
+  const setupAllohaBootstrap = () => {{
+    if (!IS_ALLOHA) return;
+    try {{
+      const params = new URL(BASE).searchParams;
+      const toInt = (value, fallback) => {{
+        const num = Number.parseInt(String(value || ""), 10);
+        return Number.isFinite(num) && num > 0 ? num : fallback;
+      }};
+      const season = toInt(params.get("season"), 1);
+      const episode = toInt(params.get("episode"), 1);
+      const translation = toInt(params.get("translation"), 0);
+      const movieToken = params.get("token_movie") || params.get("token") || "";
+      const ensureObject = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {{}};
+      const ensureArray = (value) => Array.isArray(value) ? value : [];
+      const cacheKey = "__asoplayAllohaFileList:" + BASE;
+      let cached = null;
+      try {{ cached = JSON.parse(sessionStorage.getItem(cacheKey) || "null"); }} catch (_) {{}}
+      const list = ensureObject(window.fileList || cached);
+      const active = ensureObject(list.active);
+      active.season = active.season || season;
+      active.episode = active.episode || episode;
+      active.translation = active.translation || translation;
+      active.token_movie = active.token_movie || movieToken;
+      active.token = active.token || movieToken;
+      active.typeList = ensureObject(active.typeList);
+      active.typeList.active = active.typeList.active || active.type || "iframe";
+      active.types = ensureObject(active.types);
+      active.files = ensureArray(active.files);
+      list.active = active;
+      list.typeList = ensureObject(list.typeList);
+      list.typeList.active = list.typeList.active || active.typeList.active;
+      list.typeList.list = ensureArray(list.typeList.list);
+      list.season = ensureObject(list.season);
+      list.season.active = list.season.active || season;
+      list.season.list = ensureArray(list.season.list);
+      list.seasons = ensureArray(list.seasons);
+      list.episode = ensureObject(list.episode);
+      list.episode.active = list.episode.active || episode;
+      list.episode.list = ensureArray(list.episode.list);
+      list.episodes = ensureArray(list.episodes);
+      list.translation = ensureObject(list.translation);
+      list.translation.active = list.translation.active || translation;
+      list.translation.list = ensureArray(list.translation.list);
+      list.translations = ensureArray(list.translations);
+      list.movie = ensureObject(list.movie);
+      list.movie.active = ensureObject(list.movie.active || active);
+      list.serial = ensureObject(list.serial);
+      list.serial.active = ensureObject(list.serial.active || active);
+      list.serial.season = list.serial.season || list.season;
+      list.serial.seasons = ensureArray(list.serial.seasons || list.seasons);
+      list.serial.episode = list.serial.episode || list.episode;
+      list.serial.episodes = ensureArray(list.serial.episodes || list.episodes);
+      list.serial.translation = list.serial.translation || list.translation;
+      list.serial.translations = ensureArray(list.serial.translations || list.translations);
+      window.fileList = list;
+      window.config = ensureObject(window.config);
+      window.config.player = ensureObject(window.config.player);
+      window.__asoplayAllohaFileList = list;
+      try {{ sessionStorage.setItem(cacheKey, JSON.stringify(list)); }} catch (_) {{}}
+    }} catch (_) {{}}
+  }};
+  setupAllohaBootstrap();
   const passthrough = (value) => {{
     const s = String(value || "").trim();
-    return !s || s[0] === "#" || /^(about|blob|data|javascript|mailto|tel):/i.test(s);
+    return !s || s[0] === "#" || /^(about|blob|data|javascript|mailto|tel|chrome-extension|moz-extension|safari-web-extension|ms-browser-extension):/i.test(s) || /^[a-z][a-z0-9+.-]*-extension:/i.test(s);
   }};
   const isPlayerInternalPath = (value) =>
     /^\\/player\\/(?:frame|proxy|cvh-api)(?:[/?#]|$)|^\\/player\\/(?:asoplay-shield\\.js|kodik-skin\\.css)(?:[?#]|$)/i
@@ -1218,6 +1607,7 @@ def _bridge_script(base: str) -> str:
 
   const prepareScreenshotVideo = (video) => {{
     if (!video || String(video.tagName || "").toUpperCase() !== "VIDEO") return;
+    if (video.currentSrc || video.readyState > 0) return;
     try {{
       video.crossOrigin = "anonymous";
       video.setAttribute("crossorigin", "anonymous");
@@ -1236,7 +1626,87 @@ def _bridge_script(base: str) -> str:
       }});
     }} catch (_) {{}}
   }};
-  const captureScreenshot = () => {{
+  const waitForDrawableFrame = (video) => new Promise((resolve) => {{
+    let done = false;
+    const finish = () => {{
+      if (done) return;
+      done = true;
+      try {{ video.removeEventListener("loadeddata", finish); }} catch (_) {{}}
+      resolve();
+    }};
+    try {{
+      if (video.readyState < 2) video.addEventListener("loadeddata", finish, {{ once: true }});
+      if (typeof video.requestVideoFrameCallback === "function") video.requestVideoFrameCallback(finish);
+    }} catch (_) {{}}
+    requestAnimationFrame(() => requestAnimationFrame(finish));
+    setTimeout(finish, 450);
+  }});
+  const canvasLooksEmpty = (canvas) => {{
+    const probe = document.createElement("canvas");
+    const width = Math.min(24, Math.max(1, canvas.width));
+    const height = Math.min(24, Math.max(1, canvas.height));
+    probe.width = width;
+    probe.height = height;
+    const ctx = probe.getContext("2d", {{ willReadFrequently: true }});
+    if (!ctx) return false;
+    ctx.drawImage(canvas, 0, 0, width, height);
+    const data = ctx.getImageData(0, 0, width, height).data;
+    let alpha = 0;
+    for (let i = 3; i < data.length; i += 4) alpha += data[i];
+    return alpha < width * height * 8;
+  }};
+  const drawViaImageCapture = async (video) => {{
+    try {{
+      if (!video.captureStream || !window.ImageCapture) return null;
+      const stream = video.captureStream();
+      const track = stream && stream.getVideoTracks ? stream.getVideoTracks()[0] : null;
+      if (!track) return null;
+      try {{
+        const bitmap = await new ImageCapture(track).grabFrame();
+        const canvas = document.createElement("canvas");
+        canvas.width = bitmap.width || video.videoWidth;
+        canvas.height = bitmap.height || video.videoHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return null;
+        ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+        if (bitmap.close) bitmap.close();
+        return canvasLooksEmpty(canvas) ? null : canvas;
+      }} finally {{
+        try {{ track.stop(); }} catch (_) {{}}
+      }}
+    }} catch (_) {{
+      return null;
+    }}
+  }};
+  const makeFrameCanvas = async (video) => {{
+    await waitForDrawableFrame(video);
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d", {{ willReadFrequently: true }});
+    if (!ctx) throw new Error("canvas unavailable");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (canvasLooksEmpty(canvas)) {{
+      const fallback = await drawViaImageCapture(video);
+      if (fallback) return fallback;
+      throw new Error("blank frame");
+    }}
+    return canvas;
+  }};
+  const canvasToDataUrl = (canvas) => new Promise((resolve, reject) => {{
+    if (canvas.toBlob && window.FileReader) {{
+      canvas.toBlob((blob) => {{
+        if (!blob) {{ reject(new Error("empty blob")); return; }}
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("reader failed"));
+        reader.readAsDataURL(blob);
+      }}, "image/png");
+    }} else {{
+      try {{ resolve(canvas.toDataURL("image/png")); }} catch (err) {{ reject(err); }}
+    }}
+  }});
+  const captureScreenshot = async () => {{
     const video = Array.from(document.querySelectorAll("video")).find((item) =>
       item && item.videoWidth > 0 && item.videoHeight > 0
     );
@@ -1244,15 +1714,9 @@ def _bridge_script(base: str) -> str:
       postScreenshotError("Кадр еще не готов. Запустите видео и попробуйте снова.");
       return;
     }}
-    prepareScreenshotVideo(video);
     try {{
       setScreenshotBusy(true);
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      const ctx = canvas.getContext("2d");
-      if (!ctx) throw new Error("canvas unavailable");
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const canvas = await makeFrameCanvas(video);
       const payload = {{
         type: "asoplay:screenshot",
         width: canvas.width,
@@ -1260,35 +1724,15 @@ def _bridge_script(base: str) -> str:
         time: Number(video.currentTime) || 0,
         title: document.title || ""
       }};
-      const done = (dataUrl) => {{
-        setScreenshotBusy(false);
-        payload.dataUrl = dataUrl;
-        postScreenshot(payload);
-      }};
-      if (canvas.toBlob && window.FileReader) {{
-        canvas.toBlob((blob) => {{
-          if (!blob) {{
-            setScreenshotBusy(false);
-            postScreenshotError("Не удалось сохранить кадр.");
-            return;
-          }}
-          const reader = new FileReader();
-          reader.onload = () => done(String(reader.result || ""));
-          reader.onerror = () => {{
-            setScreenshotBusy(false);
-            postScreenshotError("Не удалось прочитать кадр.");
-          }};
-          reader.readAsDataURL(blob);
-        }}, "image/png");
-      }} else {{
-        done(canvas.toDataURL("image/png"));
-      }}
+      payload.dataUrl = await canvasToDataUrl(canvas);
+      setScreenshotBusy(false);
+      postScreenshot(payload);
     }} catch (err) {{
       setScreenshotBusy(false);
       const name = err && err.name ? String(err.name) : "";
       postScreenshotError(name === "SecurityError"
         ? "Источник не разрешил снять кадр из видео."
-        : "Не удалось сделать скриншот.");
+        : "Кадр еще не отрисовался. Запустите видео и попробуйте снова.");
     }}
   }};
   const screenshotIcon =
