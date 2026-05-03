@@ -11,6 +11,8 @@ vpn.json
 .cache/
 .xray-runtime.json
 .xray.log
+.xray*.log
+deploy/
 
 # Python
 server/__pycache__/
@@ -20,6 +22,10 @@ server/__pycache__/
 .claude/
 claude-playbook-*/
 .playwright-mcp/
+CODEX.md
+docs/
+tools/
+tmp-frame.html
 .run.log
 .run.out.log
 .run.err.log

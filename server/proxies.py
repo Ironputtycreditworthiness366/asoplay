@@ -171,10 +171,18 @@ class _RateLimiter:
     def __init__(self, rps: float):
         self.min_gap = 1.0 / rps
         self.last = 0.0
-        self.lock = asyncio.Lock()
+        self.lock: asyncio.Lock | None = None
+        self.loop: asyncio.AbstractEventLoop | None = None
+
+    def _lock(self) -> asyncio.Lock:
+        loop = asyncio.get_running_loop()
+        if self.lock is None or self.loop is not loop:
+            self.lock = asyncio.Lock()
+            self.loop = loop
+        return self.lock
 
     async def wait(self) -> None:
-        async with self.lock:
+        async with self._lock():
             now = time.monotonic()
             wait = self.last + self.min_gap - now
             if wait > 0:
